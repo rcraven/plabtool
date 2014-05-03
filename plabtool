@@ -1,0 +1,412 @@
+#!/usr/bin/python
+
+import sys
+import os.path
+import xmlrpclib
+import getpass
+import datetime
+import time
+
+# PROGRAM SETTINGS ----------------------------------------------------------
+
+# you shouldn't need to change this
+plc_url         = 'https://www.planet-lab.org/PLCAPI/'
+
+# name of your PlanetLab slice
+my_slice        = ''
+
+# put your PlanetLab API username here
+plc_user        = ''
+
+# optional: path to a text file containing the password (chmod 400 plabpass)
+plc_pass_file   = '~/plabtool/plabpass'
+
+# set default action
+action          = 'help'
+
+# END PROGRAM SETTINGS ------------------------------------------------------
+
+
+# don't change these
+subaction = ''
+oneday  = 60 * 60 * 24
+oneweek = oneday * 7
+plc_pass_file = plc_pass_file.replace('~', os.path.expanduser('~'), 1)
+
+def date2str(t):
+    """Converts a timestamp string to a formatted date string"""
+    if t == None:
+        return "unknown"
+    return datetime.datetime.fromtimestamp(int(t)).strftime('%Y-%m-%d %H:%M:%S')
+
+def usage():
+    print "Ryan's PlanetLab Tool (plabtool)"
+    print ""
+    print "List of actions:"
+    print "- info       [NODE_URL]        Get info for the slice or a specific node"
+    print "- renew                        Renew the slice for max time possible (8 weeks)"
+    print "- list       [up/down/unsure]  Print newline separated list of nodes running the slice"
+    print "- add        NODE_URL          Add the slice to a single node"
+    print "- addfile    NODE_URL          Add the slice to a single node"
+    print "- del        NODE_URL          Delete the slice from a single node"
+    print "- swap       NODE_URL          Swap out the node for another one at the same site"
+    print "- purge      {all/downs}       all:   Delete the slice from all nodes"
+    print "                               downs: Delete from nodes with a last check-in older than a week"
+    print "- getsites   NODE_FILE         Output a list of site_ids of each node in the file"
+    print "- fillunique                   Add as many site-unique nodes to the slice as possible"
+    print "    [SITE_FILE [NODE_BLACKLIST]]   Optional: avoid sites listed in SITE_FILE"
+    print "                                             avoid nodes listed in NODE_BLACKLIST"
+    print ""
+    print "All actions will be done to slice \"%s\"" % my_slice
+    if not os.path.isfile(plc_pass_file):
+        print "Note: you can save a password by writing it to %s." % plc_pass_file
+    sys.exit(0)
+
+def auth_plab(api_server):
+    """Builds the auth struct and checks to see if it'll work"""
+    auth = {}
+    auth['AuthMethod'] = 'password'
+    auth['Username'] = plc_user
+    try:
+        f = open(plc_pass_file, 'r')
+        auth['AuthString'] = f.readline().strip()
+    except:
+        auth['AuthString'] = getpass.getpass("Enter PlanetLab account password for %s: " % plc_user)
+
+    # Check the auth info
+    authorized = api_server.AuthCheck(auth)
+    if not authorized:
+        sys.exit("ERROR: Authorization unsuccessful")
+    return auth
+
+def print_slice_info(api_server, auth, slice_id):
+    """Prints some key information about our slice"""
+    s = api_server.GetSlices(auth, slice_id, ['expires','max_nodes','node_ids'])
+    print "Slice info for \033[1m%s\033[0m:" % slice_id
+    print " |- Max nodes:        %d" % s[0]['max_nodes']
+    print " |- Expiration date:  %s" % date2str(s[0]['expires'])
+    print " |- Number of nodes:  %d" % len(s[0]['node_ids'])
+
+def print_node_info(api_server, auth, node_id):
+    """Prints some selected information about the given node"""
+    node = api_server.GetNodes(auth, 
+            node_id, 
+            ['boot_state', 'site_id', 'last_contact', 'run_level',
+                'slice_ids', 'version', 'last_boot', 'date_created'])
+    if not node:
+        sys.exit("Node not found")
+    site = api_server.GetSites(auth, node[0]['site_id'], ['login_base', 'name', 'node_ids', 'latitude', 'longitude', 'url'])
+    print "Node info for \033[1m%s\033[0m:" % node_id
+    print " |- State:          bs = %s / rl = %s" % (node[0]['boot_state'], node[0]['run_level'])
+    print " |- Load:           used in %d slices" % len(node[0]['slice_ids'])
+    print " |- Version:        %s" % node[0]['version']
+    print " |- Dates"
+    print " |   Last contact:  %s" % date2str(node[0]['last_contact'])
+    print " |    Last reboot:  %s" % date2str(node[0]['last_boot'])
+    print " |        Created:  %s" % date2str(node[0]['date_created'])
+    print " |- Site Details"
+    print " |             ID:  %s" % site[0]['login_base']
+    print " |      Full Name:  %s" % site[0]['name']
+    print " |       Location:  %s,%s" % (site[0]['latitude'], site[0]['longitude'])
+    print " |            URL:  %s" % site[0]['url']
+    print " |        # Nodes:  %d" % len(site[0]['node_ids'])
+
+def renew_slice(api_server, auth, slice_id):
+    """Overwrites our slice's expiration time to as far out as allowed (~8 weeks)"""
+    future = int(time.time()) + (oneweek * 7) + (oneday * 5)
+    future_str = date2str(future)
+    res = api_server.UpdateSlice(auth, slice_id, {'expires': future})
+    if res == 1:
+        print "Slice %s successfully renewed until %s" % (slice_id, future_str)
+    else:
+        print "ERROR: failed to renew slice"
+
+def list_nodes_in_slice(api_server, auth, slice_id, cond):
+    """Prints a newline separate list of node hostnames in our slice"""
+    node_ids = api_server.GetSlices(auth, slice_id, ['node_ids'])[0]['node_ids']
+    yesterday = int(time.time()) - oneday
+    if cond == 'up':
+        my_nodes = api_server.GetNodes(auth, 
+                {'-SORT': 'hostname', 'node_id': node_ids, '>last_contact': [yesterday, None]},
+                ['hostname'])
+    elif cond == 'down':
+        my_nodes = api_server.GetNodes(auth, 
+                {'-SORT': 'hostname', 'node_id': node_ids, '[last_contact': yesterday},
+                ['hostname'])
+    elif cond == 'unsure':
+        my_nodes = api_server.GetNodes(auth, 
+                {'-SORT': 'hostname', 'node_id': node_ids, '<last_contact': [1, None]},
+                ['hostname'])
+    else:
+        my_nodes = api_server.GetNodes(auth, 
+                {'-SORT': 'hostname', 'node_id': node_ids}, 
+                ['hostname'])
+    for node in my_nodes:
+        print "%s@%s" % (slice_id, node['hostname'])
+    sys.stderr.write("** %d node%s found\n" % (len(my_nodes), "s"[len(my_nodes)==1:]))
+
+def add_nodes(api_server, auth, slice_id, node_ids):
+    """Adds our slice to the given node hostname"""
+    s = api_server.GetSlices(auth, slice_id, ['max_nodes','node_ids'])
+    n_max = s[0]['max_nodes']
+    n = len(s[0]['node_ids'])
+    if (n+len(node_ids)) > n_max:
+        sys.exit("ERROR: you don't have enough slice capacity (%d/%d) to add the %d node(s)" % (n, n_max, len(node_ids)))
+
+    my_nodes = api_server.GetNodes(auth, s[0]['node_ids'], ['hostname'])
+    dupes = set(node_ids).intersection(set([x['hostname'] for x in my_nodes]))
+    if len(dupes) > 0:
+        sys.exit("ERROR: you have already added node(s) %s" % ', '.join(dupes))
+
+    res = api_server.AddSliceToNodes(auth, slice_id, node_ids)
+    if res == 1:
+        print "Your slice was successfully added to the node(s)."
+        print "Slice %s is now running on %d out of %d possible nodes." % (slice_id, n+len(node_ids), n_max)
+    else:
+        sys.exit("ERROR: failed to add slice to node(s)")
+
+def del_single_node(api_server, auth, slice_id, node_id):
+    """Deletes our slice from the given node hostname"""
+    s = api_server.GetSlices(auth, slice_id, ['max_nodes','node_ids'])
+    n_max = s[0]['max_nodes']
+    n = len(s[0]['node_ids'])
+
+    my_nodes = api_server.GetNodes(auth, s[0]['node_ids'], ['hostname'])
+    if node_id not in [x['hostname'] for x in my_nodes]:
+        sys.exit("ERROR: your slice isn't on this node")
+
+    res = api_server.DeleteSliceFromNodes(auth, slice_id, [node_id])
+    if res == 1:
+        print "Your slice was successfully deleted from %s." % node_id
+        print "Slice %s is now running on %d out of %d possible nodes." % (slice_id, n-1, n_max)
+    else:
+        sys.exit("ERROR: failed to delete slice from %s" % node_id)
+
+def swap_node(api_server, auth, slice_id, node_id):
+    """Swaps the node with another from the same site as selected by the user"""
+    site_id = api_server.GetNodes(auth, node_id, ['site_id'])[0]['site_id']
+    nodes_at_site = api_server.GetNodes(auth, 
+            {'~hostname': node_id, 'site_id': site_id}, 
+            ['node_id', 'hostname'])
+    options = len(nodes_at_site)
+
+    if options == 0:
+        print "There are no other nodes at that site to swap to."
+    else:
+        print "Select a new node to replace the previous one:"
+        for index, node in enumerate(nodes_at_site):
+            print "%d: %s (id# %d)" % (index+1, node['hostname'], node['node_id'])
+        print ""
+        while True:
+            try:
+                sel_index = int(raw_input("Enter the line number of the node you want > "))
+                if (sel_index > 0) and (sel_index <= options):
+                    break;
+            except ValueError:
+                print "Not a valid number. ",
+            print "Bad entry, try again..."
+
+        res = api_server.DeleteSliceFromNodes(auth, slice_id, [node_id])
+        if res == 1:
+            print "Your slice was successfully deleted from %s." % node_id
+        else:
+            sys.exit("ERROR: failed to delete slice from %s" % node_id)
+
+        new_node = nodes_at_site[sel_index-1]['hostname']
+        res = api_server.AddSliceToNodes(auth, slice_id, [new_node])
+        if res == 1:
+            print "Your slice was successfully added to %s." % new_node
+        else:
+            sys.exit("ERROR: failed to add slice to %s" % new_node)
+
+def purge_all_nodes(api_server, auth, slice_id):
+    """Deletes our slice from all nodes we have"""
+    node_ids = api_server.GetSlices(auth, slice_id, ['node_ids'])[0]['node_ids']
+    res = api_server.DeleteSliceFromNodes(auth, slice_id, node_ids)
+    if res == 1:
+        print "Slice %s has been deleted from all %d nodes." % (slice_id, len(node_ids))
+    else:
+        sys.exit("ERROR: failed to purge all nodes")
+
+def purge_old_nodes(api_server, auth, slice_id, cutofftime):
+    """Deletes any nodes that haven't checked in in the last [cutofftime] seconds"""
+    time_ago = int(time.time()) - cutofftime
+    node_ids = api_server.GetSlices(auth, slice_id, ['node_ids'])[0]['node_ids']
+    old_nodes = api_server.GetNodes(auth, 
+            {'node_id': node_ids, '[last_contact': time_ago},
+            ['node_id', 'hostname'])
+    old_node_ids = [x['node_id'] for x in old_nodes]
+    old_node_names = [x['hostname'] for x in old_nodes]
+    n = len(old_node_ids)
+    print "%d node%s in your slice %s been down for more than %.2f days." % \
+            (n, "s"[n==1:], ['has','have'][n!=1], cutofftime/oneday)
+
+    res = api_server.DeleteSliceFromNodes(auth, slice_id, old_node_ids)
+    if res == 1:
+        print "Slice %s has been deleted from those nodes and is now running on %d nodes." % \
+                (slice_id, len(node_ids) - len(old_node_ids))
+    else:
+        sys.exit("ERROR: failed to purge nodes that were down")
+
+def get_list_from_file(path):
+    """Returns a list where each list item is a line of the file"""
+    try:
+        f = open(path.replace('~', os.path.expanduser('~'), 1), 'r')
+    except IOError as e:
+        sys.exit("ERROR: Could not open file: %s" % e.strerror)
+    else:
+        # strip whitespace and leading usernames
+        lst = [x.strip().split('@')[-1] for x in f.readlines()]
+        f.close()
+        return lst
+
+def print_site_ids(api_server, auth, slice_id, node_ids):
+    """Translates the list of node_ids to site_ids and prints them"""
+    site_ids = [x['site_id'] for x in api_server.GetNodes(auth, node_ids, ['site_id'])]
+    for site_id in sorted(site_ids):
+        print "%d" % site_id
+    sys.stderr.write("** For %d node%s, %d site%s found\n" % \
+            (len(node_ids), "s"[len(node_ids)==1:], len(site_ids), "s"[len(site_ids)==1:]))
+
+def add_site_unique_nodes(api_server, auth, slice_id, site_file, node_blacklist):
+    """Fills our slice with as many site-unique nodes as possible, avoiding sites in site_file and nodes in node_blacklist"""
+    lastweek = int(time.time()) - oneweek
+    s = api_server.GetSlices(auth, slice_id, ['max_nodes','node_ids'])
+    my_nodes = s[0]['node_ids']
+    n = len(my_nodes)
+    n_max = s[0]['max_nodes']
+
+    print "Slice %s is using %d out of %d max nodes." % (slice_id, n, n_max)
+    if n >= n_max:
+        sys.exit("Your slice is full.  Try purging some nodes first.")
+    else:
+        print "Adding %d site-unique nodes to slice %s..." % (n_max - n, slice_id)
+
+    # 2 steps to find out which sites we need to avoid
+    # 1. Sites we're already at
+    site_ids = [x['site_id'] for x in api_server.GetNodes(auth, my_nodes, ['site_id'])]
+    # 2. Also, any site IDs listed in the site_file (append using set() to avoid dupes)
+    if site_file:
+        extra_site_ids = get_list_from_file(site_file)
+        site_ids = list(set(site_ids).union(extra_site_ids))
+
+    # see if there are any nodes we want to blacklist, build filter accordingly
+    if node_blacklist:
+        bad_nodes = get_list_from_file(node_blacklist)
+        node_filter = {'~site_id': site_ids, '~hostname': bad_nodes, '>last_contact': [lastweek, None]}
+    else:
+        node_filter = {'~site_id': site_ids, '>last_contact': [lastweek, None]}
+
+    # get a list with all of the nodes at sites we aren't in yet
+    nodes_we_can_add = api_server.GetNodes(auth, node_filter, ['node_id', 'site_id'])
+
+    # filter so we just list one node from each site (just pick the first node/site pair we see)
+    uniq_site_nodes = {}
+    for node_dict in nodes_we_can_add:
+        if node_dict['site_id'] not in uniq_site_nodes:
+            uniq_site_nodes[node_dict['site_id']] = node_dict['node_id']
+
+    print "Found %d site%s online where we don't already have a node." % \
+            (len(uniq_site_nodes), "s"[len(uniq_site_nodes)==1:])
+
+    # get a list of 1 node at each site we aren't already in
+    nodes_to_add = uniq_site_nodes.values()
+    print "\nAdding a node from each of those sites..."
+
+    # trim to how much spare capacity we have
+    spare_cap = n_max - n
+    if len(nodes_to_add) > spare_cap:
+        print "! WARN: max_nodes set to %d, had to limit our addition to %d new node%s" % \
+                (n_max, spare_cap, "s"[spare_cap==1:])
+        del nodes_to_add[spare_cap:]
+
+    # add the nodes 
+    res = api_server.AddSliceToNodes(auth, slice_id, nodes_to_add)
+    res = 1
+    if res == 1:
+        print "Your slice was successfully added to %d new node%s." % \
+                (len(nodes_to_add), "s"[len(nodes_to_add)==1:])
+        print "Slice %s is now running on %d out of %d possible nodes." % \
+                (slice_id, n + len(nodes_to_add), n_max)
+    else:
+        sys.exit("ERROR: failed to add slice to nodes")
+
+# ----------------------------------------
+
+if __name__ == "__main__":
+
+    if len(sys.argv) > 1:
+        action = sys.argv[1].lower()
+    if len(sys.argv) > 2:
+        subaction = sys.argv[2]
+    if action == 'help':
+        usage()
+
+    # make sure the script was configured
+    if my_slice == '' or plc_user == '':
+        sys.exit("ERROR: Edit the top of the script with your PlanetLab slice and user name")
+
+    # init and authenticate to the PlanetLab API
+    api_server = xmlrpclib.ServerProxy(plc_url, allow_none=True)
+    auth = auth_plab(api_server);
+
+    # execute user's command
+    if action == 'info':
+        if subaction == '':
+            print_slice_info(api_server, auth, my_slice)
+        else:
+            print_node_info(api_server, auth, subaction)
+
+    elif action == 'renew':
+        renew_slice(api_server, auth, my_slice)
+
+    elif action == 'list':
+        list_nodes_in_slice(api_server, auth, my_slice, subaction.lower())
+
+    elif action == 'add':
+        if subaction == '':
+            print "No node given"
+        else:
+            add_nodes(api_server, auth, my_slice, [subaction])
+
+    elif action == 'addfile':
+        if subaction == '':
+            print "No node file given"
+        else:
+            node_ids = get_list_from_file(subaction)
+            add_nodes(api_server, auth, my_slice, node_ids)
+
+    elif action == 'del':
+        if subaction == '':
+            print "No node given"
+        else:
+            del_single_node(api_server, auth, my_slice, subaction)
+
+    elif action == 'swap':
+        if subaction == '':
+            print "No node given"
+        else:
+            swap_node(api_server, auth, my_slice, subaction)
+
+    elif action == 'purge':
+        subaction = subaction.lower()
+        if subaction == 'downs':
+            purge_old_nodes(api_server, auth, my_slice, oneweek)
+        elif subaction == 'all':
+            purge_all_nodes(api_server, auth, my_slice)
+        else:
+            print "Must choose to either purge all nodes or ones that are down"
+
+    elif action == 'getsites':
+        if subaction == '':
+            print "No node file given"
+        else:
+            node_ids = get_list_from_file(subaction)
+            print_site_ids(api_server, auth, my_slice, node_ids)
+
+    elif action == 'fillunique':
+        add_site_unique_nodes(api_server, auth, my_slice, subaction, sys.argv[3])
+
+    else:
+        sys.exit("ERROR: Unknown command (see 'help' for valid commands)")
+
